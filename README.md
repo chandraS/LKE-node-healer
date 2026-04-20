@@ -115,7 +115,7 @@ kubectl -n node-healer set env deployment/node-healer LINODE_CLUSTER_ID=270250
 ### 6. Deploy
 
 ```bash
-kubectl apply -f k8s/deployment.yaml
+kubectl apply -f K8s/deployment.yaml
 ```
 
 ### 7. Verify
