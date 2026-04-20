@@ -30,7 +30,7 @@ spec:
 
       containers:
         - name: node-healer
-          image: shicha/node-healer:v5 
+          image: your-registry/lke-node-healer:latest 
           imagePullPolicy: Always
 
           env:
