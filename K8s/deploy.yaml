@@ -1,0 +1,88 @@
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: node-healer
+  namespace: node-healer
+  labels:
+    app: node-healer
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: node-healer
+  template:
+    metadata:
+      labels:
+        app: node-healer
+    spec:
+      serviceAccountName: node-healer
+
+      tolerations:
+        - key: "node.kubernetes.io/not-ready"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 30
+        - key: "node.kubernetes.io/unreachable"
+          operator: "Exists"
+          effect: "NoExecute"
+          tolerationSeconds: 30
+
+      containers:
+        - name: node-healer
+          image: shicha/node-healer:v5 
+          imagePullPolicy: Always
+
+          env:
+            # How long a node must stay unhealthy before remediation
+            - name: UNHEALTHY_THRESHOLD_SECONDS
+              value: "60"
+
+            # Cooldown after remediating a node
+            - name: COOLDOWN_SECONDS
+              value: "600"
+
+            # How long to wait for the new node to be Ready before draining/deleting
+            - name: NEW_NODE_READY_TIMEOUT
+              value: "300"
+
+            # kubectl drain timeout
+            - name: DRAIN_TIMEOUT
+              value: "120"
+
+            # Set to "true" to observe without calling any API
+            - name: DRY_RUN
+              value: "false"
+
+            # Comma-separated node names to never remediate
+            - name: EXCLUDE_NODES
+              value: ""
+
+            # LKE cluster ID — used for Linode API calls and pool node matching
+            - name: LINODE_CLUSTER_ID
+              value: "270250"   
+
+            # Linode API token from Secret
+            - name: LINODE_TOKEN
+              valueFrom:
+                secretKeyRef:
+                  name: linode-api-token
+                  key: token
+
+          resources:
+            requests:
+              cpu: "50m"
+              memory: "64Mi"
+            limits:
+              cpu: "200m"
+              memory: "128Mi"
+
+          livenessProbe:
+            exec:
+              command: ["pgrep", "-f", "node_healer.py"]
+            initialDelaySeconds: 10
+            periodSeconds: 30
+            failureThreshold: 3
+
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30
