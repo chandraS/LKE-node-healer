@@ -1,11 +1,20 @@
-
 # LKE Node Healer
 
 ## Overview
 
-LKE Node Healer is a single Python script that runs as a Kubernetes Deployment and watches all nodes in an LKE cluster. When a node becomes unhealthy and remains unhealthy for 60 seconds, the script begins a removal workflow: it pre-provisions a replacement node, drains the unhealthy node, and deletes the corresponding Linode instance.
+LKE Node Healer is a lightweight Python script running as a Kubernetes Deployment that watches all nodes in an LKE or LKE-E cluster. When a node is found to be externally cordoned (`Unschedulable=true`), the script annotates it with `lke.ops/needs-attention=true` so the ops team is alerted and can investigate the root cause manually.
 
-LKE auto-heal then keeps the pool size aligned automatically.
+The script does **not** auto-remediate. No nodes are drained or deleted. Remediation is left to the ops team.
+
+---
+
+
+In LKE, a node can become cordoned (`Unschedulable=true`) without being unhealthy from Kubernetes' perspective. 
+
+
+In this state the node shows `Ready=True` but no pods can be scheduled onto it. It is effectively unusable and Kubernetes has no native mechanism to detect or remediate this automatically.
+
+The healer detects this condition and annotates the node so the ops team is notified.
 
 ---
 
@@ -13,74 +22,82 @@ LKE auto-heal then keeps the pool size aligned automatically.
 
 ### 1. Watch nodes
 
-The script opens a persistent streaming connection to the Kubernetes API server.
+The script opens a persistent streaming connection to the Kubernetes API server using the Kubernetes Python client. There is no polling loop — the API server pushes an event every time any node's status changes.
 
-Instead of polling, it receives node status change events directly from the API server. Under normal conditions, this stream remains open indefinitely and receives kubelet heartbeat-related updates roughly every 10 seconds per node.
+The watch stream reconnects automatically if the connection drops. On reconnect, the current state of all nodes is fetched before resuming the stream so no events are missed.
 
-### 2. Detect unhealthy conditions
+The script authenticates using the ServiceAccount token automatically mounted into the pod at `/var/run/secrets/kubernetes.io/serviceaccount/token`. No kubeconfig or kubectl is required.
 
-On each event, the script evaluates the node's conditions.
+### 2. Detect externally cordoned nodes
 
-A node is treated as unhealthy if any of the following is true:
+On each event, the script checks `node.spec.unschedulable`. If it is `true`, the node has been cordoned by something other than this script (this script never cordons nodes itself).
 
-- `Ready = False` or `Unknown`
-- `DiskPressure = True`
-- `MemoryPressure = True`
-- `NetworkUnavailable = True`
-- `PIDPressure = True`
+Common causes:
 
-The script ignores conditions that happen during normal node startup or shutdown, such as:
+- Route controller failure due to a reserved IP in the pod CIDR (`FailedToCreateRoute`)
+- Manual `kubectl cordon` by an operator
+- An admission webhook or external controller
 
-- CNI not initialized
-- CSI not ready
-- Calico shutting down
+### 3. Annotate the node
 
-These are not considered real failure states.
+When an externally cordoned node is detected, the script annotates it once with three annotations:
 
-### 3. Pre-provision a replacement (`t = 0`)
+| Annotation | Value |
+|---|---|
+| `lke.ops/needs-attention` | `"true"` |
+| `lke.ops/attention-reason` | Human readable description of the condition |
+| `lke.ops/attention-since` | Unix timestamp when first detected |
 
-As soon as a node is first detected as unhealthy, the script calls the Linode API to increase the node pool size by 1.
+The annotation is set only once per cordon event. Subsequent watch events for the same node are silently skipped until the node is uncordoned.
 
-This starts provisioning a replacement immediately, even before the 60-second unhealthy threshold has elapsed.
+### 4. Clear annotation on recovery
 
-The pool size temporarily changes from:
+When the node is uncordoned (`spec.unschedulable` flips to `false`), the script detects the change via the watch stream and removes all three annotations automatically.
 
-- `N` → `N + 1`
+### 5. Startup sync
 
-If the pool is already at its autoscaler maximum, the script first raises the autoscaler maximum by 1, then increases the node count. This ensures a replacement node can still be created even when the pool is at capacity.
+On startup, the script scans all existing nodes for the `lke.ops/needs-attention=true` annotation before opening the watch stream. This ensures that if the script pod is rescheduled (e.g. after a node failure), it can still clear annotations from nodes that were annotated by the previous instance when those nodes are eventually uncordoned.
 
-### 4. Wait for the threshold (60 seconds)
+---
 
-The script gives the unhealthy node a chance to recover on its own.
+## Querying Affected Nodes
 
-The 60-second timer begins when the node is first observed as unhealthy. If the node recovers before the threshold is reached, the pre-provisioned replacement is removed and the cluster returns to its original state.
+```bash
+# List all nodes needing attention
+kubectl get nodes -o json | \
+  jq -r '.items[] | select(.metadata.annotations["lke.ops/needs-attention"] == "true") | .metadata.name'
 
-### 5. Run the node removal sequence
+# See the reason on a specific node
+kubectl get node <node-name> -o jsonpath='{.metadata.annotations.lke\.ops/attention-reason}'
 
-If the node is still unhealthy after 60 seconds, the script begins the removal workflow:
+# See when it was first detected (unix timestamp)
+kubectl get node <node-name> -o jsonpath='{.metadata.annotations.lke\.ops/attention-since}'
 
-1. Wait for the replacement node to become `Ready`
-2. Cordon the unhealthy node so no new pods are scheduled onto it
-3. Drain the unhealthy node so existing pods are evicted and rescheduled
-4. Delete the Linode instance through the Linode API
-5. Restore the autoscaler maximum if it was temporarily increased
+# See all needs-attention annotations on a node
+kubectl describe node <node-name> | grep "lke.ops"
+```
 
-When the unhealthy instance is deleted, the pool count returns automatically to its original size.
 
 ---
 
 ## Deployment
+
+### Prerequisites
+
+- A running LKE or LKE-E cluster
+- `kubectl` configured to talk to the cluster
+- Docker or equivalent to build and push the image
 
 ### 1. Build and push the image
 
 ```bash
 docker build -t your-registry/lke-node-healer:latest .
 docker push your-registry/lke-node-healer:latest
-````
+```
 
 ### 2. Update the image reference
 
-Edit `K8s/deployment.yaml` and replace the image field:
+Edit `k8s/deployment.yaml` and replace:
 
 ```yaml
 image: your-registry/lke-node-healer:latest
@@ -89,36 +106,16 @@ image: your-registry/lke-node-healer:latest
 ### 3. Apply RBAC
 
 ```bash
-kubectl apply -f K8s/rbac.yaml
+kubectl apply -f k8s/rbac.yaml
 ```
 
-### 4. Create the Linode API token secret
+### 4. Deploy
 
 ```bash
-kubectl -n node-healer create secret generic linode-api-token \
-  --from-literal=token=YOUR_LINODE_TOKEN_HERE
+kubectl apply -f k8s/deployment.yaml
 ```
 
-### 5. Set the cluster ID
-
-Find your cluster ID from either:
-
-* the Linode Cloud Manager URL, or
-* the node naming format: `lke{clusterID}-{poolID}-{hash}`
-
-Then set it on the Deployment:
-
-```bash
-kubectl -n node-healer set env deployment/node-healer LINODE_CLUSTER_ID=270250
-```
-
-### 6. Deploy
-
-```bash
-kubectl apply -f K8s/deployment.yaml
-```
-
-### 7. Verify
+### 5. Verify
 
 ```bash
 kubectl -n node-healer get pods
@@ -127,8 +124,9 @@ kubectl -n node-healer logs -f deployment/node-healer
 
 Expected startup output:
 
-```text
-LKE Node Healer started | DRY_RUN=false | THRESHOLD=60s | COOLDOWN=600s | CLUSTER=270250
+```
+LKE Node Healer started | DRY_RUN=false | EXCLUDE=none | mode=annotation-only (no auto-remediation)
+startup sync — no previously annotated nodes found
 Starting node watch stream...
 ```
 
@@ -136,65 +134,94 @@ Starting node watch stream...
 
 ## Configuration
 
-All settings are configured as environment variables in `k8s/deployment.yaml`.
+All settings are environment variables in `k8s/deployment.yaml`.
 
-| Variable                      | Description                                                      | Default  |
-| ----------------------------- | ---------------------------------------------------------------- | -------- |
-| `UNHEALTHY_THRESHOLD_SECONDS` | Time a node must remain unhealthy before removal begins          | `60`     |
-| `COOLDOWN_SECONDS`            | Time to ignore a node after deletion to avoid acting on it twice | `600`    |
-| `NEW_NODE_READY_TIMEOUT`      | Maximum time to wait for the replacement node to become `Ready`  | `300`    |
-| `DRAIN_TIMEOUT`               | How long `kubectl drain` waits before giving up                  | `120`    |
-| `LINODE_CLUSTER_ID`           | LKE cluster ID used for pre-provisioning                         | Required |
-| `LINODE_TOKEN`                | Linode API token injected from the Kubernetes Secret             | Required |
-| `EXCLUDE_NODES`               | Comma-separated list of node names that should never be touched  | Optional |
-| `DRY_RUN`                     | When `true`, logs all actions without calling APIs               | `false`  |
+| Variable | Description | Default |
+|---|---|---|
+| `DRY_RUN` | When `true`, logs intended actions without annotating any nodes | `false` |
+| `EXCLUDE_NODES` | Comma-separated node names to never annotate | `""` |
 
 ---
 
 ## Testing
 
-The safest way to test is to enable dry-run mode first.
-
-### Enable dry-run mode
+### Option 1 — DRY_RUN + kubectl cordon (zero risk)
 
 ```bash
+# Enable dry-run
 kubectl -n node-healer set env deployment/node-healer DRY_RUN=true
-```
 
-Then manually power off a worker node from Linode Cloud Manager and watch the logs to confirm:
+# Cordon a node
+kubectl cordon <node-name>
 
-* unhealthy node detection
-* threshold timing
-* replacement pre-provisioning logic
-* removal workflow logging
+# Watch logs — should see detection but no annotation set
+kubectl -n node-healer logs -f deployment/node-healer
 
-Once the behavior looks correct, disable dry-run mode and repeat the test with a real node.
+# Uncordon
+kubectl uncordon <node-name>
 
-### Disable dry-run mode
-
-```bash
+# Disable dry-run
 kubectl -n node-healer set env deployment/node-healer DRY_RUN=false
 ```
 
+### Option 2 — Full test with annotation
+
+```bash
+# Cordon a node
+kubectl cordon <node-name>
+
+# Verify annotation is set
+kubectl get node <node-name> -o jsonpath='{.metadata.annotations.lke\.ops/needs-attention}'
+# output: true
+
+# Uncordon the node
+kubectl uncordon <node-name>
+
+# Verify annotation is cleared
+kubectl get node <node-name> -o jsonpath='{.metadata.annotations.lke\.ops/needs-attention}'
+# output: (empty)
+```
+
+### Option 3 — Test startup sync (restart recovery)
+
+```bash
+# Cordon a node and let the script annotate it
+kubectl cordon <node-name>
+
+# Restart the script pod (simulates pod rescheduling after node failure)
+kubectl -n node-healer rollout restart deployment/node-healer
+
+# Watch logs on restart — should see sync picking up the existing annotation
+kubectl -n node-healer logs -f deployment/node-healer
+# Expected: startup sync — found 1 previously annotated node(s): <node-name>
+
+# Uncordon the node — annotation should be cleared correctly
+kubectl uncordon <node-name>
+```
+
 ---
 
-## Expected Behavior Summary
+## Clearing Annotations Manually
 
-When a node fails:
+If the script pod is unavailable and annotations need to be cleared manually:
 
-1. The script detects the unhealthy condition
-2. A replacement node is provisioned immediately
-3. The script waits 60 seconds to allow recovery
-4. If the node does not recover:
-
-   * the replacement must become ready
-   * the bad node is cordoned
-   * the bad node is drained
-   * the Linode instance is deleted
-5. The pool returns to its intended size automatically
+```bash
+kubectl annotate node <node-name> \
+  lke.ops/needs-attention- \
+  lke.ops/attention-reason- \
+  lke.ops/attention-since-
+```
 
 ---
 
+## File Structure
 
-
-
+```
+lke-node-healer/
+├── node_healer.py        # Main script
+├── Dockerfile
+├── requirements.txt
+└── k8s/
+    ├── rbac.yaml         # Namespace, ServiceAccount, ClusterRole, ClusterRoleBinding
+    └── deployment.yaml   # Deployment
+```
