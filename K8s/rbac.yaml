@@ -17,30 +17,10 @@ kind: ClusterRole
 metadata:
   name: node-healer
 rules:
-  # Nodes — watch for health, patch for cordon
+  # Nodes — watch for Unschedulable=true, patch to set annotations
   - apiGroups: [""]
     resources: ["nodes"]
     verbs: ["get", "list", "watch", "patch"]
-
-  # Pods — list needed by kubectl drain
-  - apiGroups: [""]
-    resources: ["pods"]
-    verbs: ["get", "list"]
-
-  # Pod eviction — needed by kubectl drain
-  - apiGroups: [""]
-    resources: ["pods/eviction"]
-    verbs: ["create"]
-
-  # PodDisruptionBudgets — drain respects PDBs
-  - apiGroups: ["policy"]
-    resources: ["poddisruptionbudgets"]
-    verbs: ["get", "list"]
-
-  # DaemonSets — read needed by kubectl drain --ignore-daemonsets
-  - apiGroups: ["apps"]
-    resources: ["daemonsets"]
-    verbs: ["get", "list"]
 
 ---
 apiVersion: rbac.authorization.k8s.io/v1
