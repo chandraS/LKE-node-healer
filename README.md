@@ -32,11 +32,6 @@ The script authenticates using the ServiceAccount token automatically mounted in
 
 On each event, the script checks `node.spec.unschedulable`. If it is `true`, the node has been cordoned by something other than this script (this script never cordons nodes itself).
 
-Common causes:
-
-- Route controller failure due to a reserved IP in the pod CIDR (`FailedToCreateRoute`)
-- Manual `kubectl cordon` by an operator
-- An admission webhook or external controller
 
 ### 3. Annotate the node
 
